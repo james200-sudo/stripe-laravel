@@ -8,9 +8,13 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Stripe\Stripe;
 use Stripe\Checkout\Session;
+use Stripe\Subscription;
+use Stripe\Webhook;
 
 class StripeController extends Controller
 {
+    private $pocketbaseUrl = 'https://hydro-ai-chat.ensolutions.ca';
+    
     public function __construct()
     {
         Stripe::setApiKey(config('services.stripe.secret'));
@@ -59,7 +63,7 @@ class StripeController extends Controller
                         'currency' => strtolower($validated['currency']),
                         'product_data' => [
                             'name' => $validated['plan_name'],
-                            'description' => 'Hydro AI - ' . $validated['plan_name'] . ' Plan',
+                            'description' => 'TGM HydroAI - ' . $validated['plan_name'] . ' Plan',
                         ],
                         'unit_amount' => (int)($validated['amount'] * 100), // Convertir en centimes
                         'recurring' => [
@@ -71,7 +75,7 @@ class StripeController extends Controller
                 'mode' => 'subscription',
                 'success_url' => $validated['success_url'] . '?session_id={CHECKOUT_SESSION_ID}',
                 'cancel_url' => $validated['cancel_url'],
-                'client_reference_id' => $userId, // ID PocketBase pour identifier l'utilisateur
+                'client_reference_id' => $userId, // ID PocketBase
                 'customer_email' => $userEmail,
                 'metadata' => array_merge([
                     'user_id' => $userId,
@@ -154,17 +158,19 @@ class StripeController extends Controller
             $user = $request->input('pocketbase_user');
             $userId = $user['id'];
 
-            // Récupérer les abonnements actifs pour cet utilisateur
-            $subscriptions = \Stripe\Subscription::all([
-                'limit' => 10,
-            ]);
+            // Récupérer les abonnements actifs
+            $subscriptions = Subscription::all(['limit' => 10]);
 
             // Filtrer par metadata user_id
-            $userSubscriptions = array_filter($subscriptions->data, function($sub) use ($userId) {
-                return isset($sub->metadata['user_id']) && $sub->metadata['user_id'] === $userId;
-            });
+            $userSubscription = null;
+            foreach ($subscriptions->data as $sub) {
+                if (isset($sub->metadata['user_id']) && $sub->metadata['user_id'] === $userId) {
+                    $userSubscription = $sub;
+                    break;
+                }
+            }
 
-            if (empty($userSubscriptions)) {
+            if (!$userSubscription) {
                 return response()->json([
                     'success' => true,
                     'has_subscription' => false,
@@ -172,19 +178,127 @@ class StripeController extends Controller
                 ]);
             }
 
-            $subscription = reset($userSubscriptions);
-
             return response()->json([
                 'success' => true,
                 'has_subscription' => true,
-                'status' => $subscription->status,
-                'plan_name' => $subscription->metadata['plan_name'] ?? 'Unknown',
-                'current_period_end' => date('Y-m-d', $subscription->current_period_end),
+                'status' => $userSubscription->status,
+                'plan_name' => $userSubscription->metadata['plan_name'] ?? 'Unknown',
+                'current_period_end' => date('Y-m-d', $userSubscription->current_period_end),
             ]);
             
         } catch (\Exception $e) {
             Log::error('Error getting subscription status', ['error' => $e->getMessage()]);
             return response()->json(['error' => 'Erreur lors de la récupération du statut'], 500);
+        }
+    }
+
+    /**
+     * Annuler l'abonnement
+     */
+    public function cancelSubscription(Request $request)
+    {
+        try {
+            $user = $request->input('pocketbase_user');
+            $userId = $user['id'];
+
+            // Trouver l'abonnement de l'utilisateur
+            $subscriptions = Subscription::all(['limit' => 10]);
+            
+            $userSubscription = null;
+            foreach ($subscriptions->data as $sub) {
+                if (isset($sub->metadata['user_id']) && $sub->metadata['user_id'] === $userId) {
+                    $userSubscription = $sub;
+                    break;
+                }
+            }
+
+            if (!$userSubscription) {
+                return response()->json([
+                    'error' => 'Aucun abonnement trouvé'
+                ], 404);
+            }
+
+            // Annuler l'abonnement à la fin de la période
+            $canceled = $userSubscription->cancel(['at_period_end' => true]);
+
+            Log::info('Subscription cancelled', [
+                'user_id' => $userId,
+                'subscription_id' => $userSubscription->id,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Abonnement annulé avec succès',
+                'cancel_at' => date('Y-m-d', $canceled->cancel_at),
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Error cancelling subscription', ['error' => $e->getMessage()]);
+            return response()->json([
+                'error' => 'Erreur lors de l\'annulation de l\'abonnement'
+            ], 500);
+        }
+    }
+
+    /**
+     * Synchroniser le statut d'abonnement
+     */
+    public function syncSubscriptionStatus(Request $request)
+    {
+        try {
+            $user = $request->input('pocketbase_user');
+            $userId = $user['id'];
+            
+            Log::info('Syncing subscription status for user', ['user_id' => $userId]);
+            
+            // Récupérer tous les abonnements
+            $subscriptions = Subscription::all(['limit' => 10]);
+            
+            $userSubscription = null;
+            foreach ($subscriptions->data as $sub) {
+                if (isset($sub->metadata['user_id']) && $sub->metadata['user_id'] === $userId) {
+                    $userSubscription = $sub;
+                    break;
+                }
+            }
+            
+            if (!$userSubscription) {
+                // Aucun abonnement - rétrograder
+                $this->downgradeToPocketBase($userId);
+                
+                return response()->json([
+                    'success' => true,
+                    'has_subscription' => false,
+                    'message' => 'No active subscription found',
+                ]);
+            }
+            
+            // Vérifier si actif
+            if ($userSubscription->status === 'active') {
+                $this->syncPocketBaseWithStripe($userId, $userSubscription);
+                
+                return response()->json([
+                    'success' => true,
+                    'has_subscription' => true,
+                    'status' => $userSubscription->status,
+                    'plan_name' => $userSubscription->metadata['plan_name'] ?? 'Unknown',
+                    'current_period_end' => date('Y-m-d', $userSubscription->current_period_end),
+                ]);
+            } else {
+                // Abonnement inactif
+                $this->downgradeToPocketBase($userId);
+                
+                return response()->json([
+                    'success' => true,
+                    'has_subscription' => false,
+                    'status' => $userSubscription->status,
+                    'message' => 'Subscription is not active',
+                ]);
+            }
+            
+        } catch (\Exception $e) {
+            Log::error('Error syncing subscription', ['error' => $e->getMessage()]);
+            return response()->json(['error' => 'Failed to sync subscription'], 500);
         }
     }
 
@@ -198,7 +312,7 @@ class StripeController extends Controller
         $webhookSecret = config('services.stripe.webhook_secret');
 
         try {
-            $event = \Stripe\Webhook::constructEvent($payload, $sigHeader, $webhookSecret);
+            $event = Webhook::constructEvent($payload, $sigHeader, $webhookSecret);
 
             Log::info('Webhook received', ['type' => $event->type]);
 
@@ -240,9 +354,10 @@ class StripeController extends Controller
         }
     }
 
-    /**
-     * Gérer la complétion du checkout
-     */
+    // =============================================
+    // WEBHOOK HANDLERS
+    // =============================================
+
     private function handleCheckoutCompleted($session)
     {
         try {
@@ -256,7 +371,6 @@ class StripeController extends Controller
                 'session_id' => $session->id
             ]);
 
-            // Mettre à jour l'utilisateur dans PocketBase
             $this->updatePocketBaseUser($userId, $planId, $planName, $session);
             
         } catch (\Exception $e) {
@@ -264,9 +378,6 @@ class StripeController extends Controller
         }
     }
 
-    /**
-     * Gérer la création d'abonnement
-     */
     private function handleSubscriptionCreated($subscription)
     {
         Log::info('Subscription created', [
@@ -275,35 +386,30 @@ class StripeController extends Controller
         ]);
     }
 
-    /**
-     * Gérer la mise à jour d'abonnement
-     */
     private function handleSubscriptionUpdated($subscription)
     {
         Log::info('Subscription updated', [
             'subscription_id' => $subscription->id,
             'status' => $subscription->status
         ]);
+        
+        // Synchroniser avec PocketBase
+        if (isset($subscription->metadata['user_id'])) {
+            $this->syncPocketBaseWithStripe($subscription->metadata['user_id'], $subscription);
+        }
     }
 
-    /**
-     * Gérer la suppression d'abonnement
-     */
     private function handleSubscriptionDeleted($subscription)
     {
         Log::info('Subscription deleted', [
             'subscription_id' => $subscription->id
         ]);
         
-        // Rétrograder l'utilisateur au plan gratuit
         if (isset($subscription->metadata['user_id'])) {
             $this->downgradeToPocketBase($subscription->metadata['user_id']);
         }
     }
 
-    /**
-     * Gérer le paiement réussi
-     */
     private function handlePaymentSucceeded($invoice)
     {
         Log::info('Payment succeeded', [
@@ -312,9 +418,6 @@ class StripeController extends Controller
         ]);
     }
 
-    /**
-     * Gérer le paiement échoué
-     */
     private function handlePaymentFailed($invoice)
     {
         Log::error('Payment failed', [
@@ -323,99 +426,169 @@ class StripeController extends Controller
         ]);
     }
 
-    /**
-     * Mettre à jour l'utilisateur dans PocketBase
-     */
+    // =============================================
+    // POCKETBASE SYNC METHODS
+    // =============================================
+
     private function updatePocketBaseUser($userId, $planId, $planName, $session)
     {
         try {
-            $pocketbaseUrl = 'https://hydro-ai-chat.ensolutions.ca';
-            
             Log::info('Updating PocketBase user', [
                 'user_id' => $userId,
                 'plan_id' => $planId,
                 'plan_name' => $planName
             ]);
 
-            // Si on n'a pas de plan_id, on le récupère depuis PocketBase
-            if (!$planId) {
-                $plansResponse = Http::get("{$pocketbaseUrl}/api/collections/plans/records", [
-                    'filter' => "name='{$planName}'"
+            // Mapping des plans
+            $planMapping = [
+                'Free' => 'xkdv2sqngtpnqjp',
+                'Individual' => 'iox7db52ee17vnf',
+                'Company' => 'hnahry5t5ardea3',
+                'Hydropower Utilities' => '7iw3959pf0rbo7m',
+            ];
+
+            $pocketbasePlanId = $planMapping[$planName] ?? null;
+            
+            if (!$pocketbasePlanId) {
+                Log::warning('Plan name not found in mapping', ['plan_name' => $planName]);
+                
+                // Tentative de récupération depuis PocketBase
+                $plansResponse = Http::get("{$this->pocketbaseUrl}/api/collections/plans/records", [
+                    'filter' => "Name~'{$planName}'"
                 ]);
 
                 if ($plansResponse->successful()) {
                     $plans = $plansResponse->json();
-                    $planId = $plans['items'][0]['id'] ?? null;
+                    if (!empty($plans['items'])) {
+                        $pocketbasePlanId = $plans['items'][0]['id'];
+                        Log::info('Plan found in PocketBase', ['plan_id' => $pocketbasePlanId]);
+                    }
                 }
             }
 
-            if (!$planId) {
-                Log::error("Plan not found in PocketBase", ['plan_name' => $planName]);
+            if (!$pocketbasePlanId) {
+                Log::error('Unable to determine plan ID', ['plan_name' => $planName]);
                 return;
             }
 
-            // Mettre à jour l'utilisateur
+            // Période d'abonnement
+            $isYearly = isset($session->metadata['billing_period']) 
+                && $session->metadata['billing_period'] === 'yearly';
+            
+            $subscriptionEndDate = now()->addMonths($isYearly ? 12 : 1);
+
+            // Données à mettre à jour
+            $updateData = [
+                'plan' => $pocketbasePlanId,
+                'subscriptionStatus' => 'active',
+                'stripeCustomerId' => $session->customer ?? null,
+                'stripeSubscriptionId' => $session->subscription ?? null,
+                'subscriptionEndDate' => $subscriptionEndDate->toIso8601String(),
+                'lastPaymentDate' => now()->toIso8601String(),
+            ];
+
+            Log::info('Sending update to PocketBase', $updateData);
+
             $response = Http::patch(
-                "{$pocketbaseUrl}/api/collections/users/records/{$userId}",
-                [
-                    'plan' => $planId,
-                    'subscription_status' => 'active',
-                    'stripe_customer_id' => $session->customer ?? null,
-                    'subscription_end_date' => now()->addMonth()->toIso8601String(),
-                ]
+                "{$this->pocketbaseUrl}/api/collections/users/records/{$userId}",
+                $updateData
             );
 
             if ($response->successful()) {
-                Log::info("User successfully upgraded", [
+                Log::info('User successfully upgraded', [
                     'user_id' => $userId,
-                    'plan' => $planName
+                    'plan' => $planName,
+                    'expires' => $subscriptionEndDate->format('Y-m-d'),
                 ]);
             } else {
-                Log::error("Failed to update PocketBase user", [
+                Log::error('Failed to update PocketBase user', [
                     'status' => $response->status(),
-                    'body' => $response->body()
+                    'body' => $response->body(),
+                    'user_id' => $userId,
                 ]);
             }
 
         } catch (\Exception $e) {
-            Log::error("Error updating PocketBase user", [
+            Log::error('Error updating PocketBase user', [
                 'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
                 'user_id' => $userId
             ]);
         }
     }
 
-    /**
-     * Rétrograder un utilisateur au plan gratuit
-     */
+    private function syncPocketBaseWithStripe($userId, $subscription)
+    {
+        try {
+            $planName = $subscription->metadata['plan_name'] ?? 'Unknown';
+            
+            $planMapping = [
+                'Free' => 'xkdv2sqngtpnqjp',
+                'Individual' => 'iox7db52ee17vnf',
+                'Company' => 'hnahry5t5ardea3',
+                'Hydropower Utilities' => '7iw3959pf0rbo7m',
+            ];
+            
+            $planId = $planMapping[$planName] ?? null;
+            
+            if (!$planId) {
+                Log::warning('Unknown plan during sync', ['plan_name' => $planName]);
+                return;
+            }
+            
+            $updateData = [
+                'plan' => $planId,
+                'subscriptionStatus' => $subscription->status,
+                'stripeSubscriptionId' => $subscription->id,
+                'subscriptionEndDate' => date('c', $subscription->current_period_end),
+            ];
+            
+            Http::patch(
+                "{$this->pocketbaseUrl}/api/collections/users/records/{$userId}",
+                $updateData
+            );
+            
+            Log::info('PocketBase synced with Stripe', [
+                'user_id' => $userId,
+                'plan' => $planName,
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Error syncing PocketBase', ['error' => $e->getMessage()]);
+        }
+    }
+
     private function downgradeToPocketBase($userId)
     {
         try {
-            $pocketbaseUrl = 'https://hydro-ai-chat.ensolutions.ca';
+            Log::info('Downgrading user to free plan', ['user_id' => $userId]);
             
-            // Récupérer le plan gratuit
-            $plansResponse = Http::get("{$pocketbaseUrl}/api/collections/plans/records", [
-                'filter' => "name='Free'"
-            ]);
+           $freePlanId = 'xkdv2sqngtpnqjp';
+            
+            $updateData = [
+                'plan' => $freePlanId,
+                'subscriptionStatus' => 'cancelled',
+                'subscriptionEndDate' => now()->toIso8601String(),
+            ];
 
-            if ($plansResponse->successful()) {
-                $plans = $plansResponse->json();
-                $freePlanId = $plans['items'][0]['id'] ?? null;
-
-                if ($freePlanId) {
-                    Http::patch(
-                        "{$pocketbaseUrl}/api/collections/users/records/{$userId}",
-                        [
-                            'plan' => $freePlanId,
-                            'subscription_status' => 'cancelled',
-                        ]
-                    );
-                    
-                    Log::info("User downgraded to free plan", ['user_id' => $userId]);
-                }
+            $response = Http::patch(
+                "{$this->pocketbaseUrl}/api/collections/users/records/{$userId}",
+                $updateData
+            );
+            
+            if ($response->successful()) {
+                Log::info('User downgraded to free plan', ['user_id' => $userId]);
+            } else {
+                Log::error('Failed to downgrade user', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
             }
         } catch (\Exception $e) {
-            Log::error("Error downgrading user", ['error' => $e->getMessage()]);
+            Log::error('Error downgrading user', [
+                'error' => $e->getMessage(),
+                'user_id' => $userId
+            ]);
         }
     }
 }

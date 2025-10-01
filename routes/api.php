@@ -41,6 +41,9 @@ Route::middleware('pocketbase.auth')->group(function () {
     
     // Changer de plan (upgrade/downgrade)
     Route::post('/stripe/change-plan', [StripeController::class, 'changePlan']);
+    
+    // Synchroniser le statut d'abonnement avec PocketBase
+    Route::get('/stripe/sync-subscription', [StripeController::class, 'syncSubscriptionStatus']);
 });
 
 // ========================================
@@ -54,3 +57,5 @@ Route::get('/csrf-token', function () {
         'csrf_token' => csrf_token()
     ]);
 });
+
+    
