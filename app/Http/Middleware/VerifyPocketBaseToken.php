@@ -4,7 +4,6 @@ namespace App\Http\Middleware;
 
 use Closure;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
 
 class VerifyPocketBaseToken
 {
@@ -18,25 +17,55 @@ class VerifyPocketBaseToken
             ], 401);
         }
 
-        // Vérifier le token auprès de PocketBase
-        $response = Http::withHeaders([
-            'Authorization' => $token,
-        ])->get('https://hydro-ai-chat.ensolutions.ca/api/collections/users/auth-refresh');
+        // Décoder le JWT sans vérification (pour récupérer les infos utilisateur)
+        try {
+            $parts = explode('.', $token);
+            if (count($parts) !== 3) {
+                return response()->json([
+                    'error' => 'Format de token invalide'
+                ], 401);
+            }
 
-        if ($response->failed()) {
+            $payload = json_decode(base64_decode(strtr($parts[1], '-_', '+/')), true);
+            
+            if (!$payload) {
+                return response()->json([
+                    'error' => 'Token invalide'
+                ], 401);
+            }
+
+            // Vérifier l'expiration
+            if (isset($payload['exp']) && $payload['exp'] < time()) {
+                return response()->json([
+                    'error' => 'Token expiré'
+                ], 401);
+            }
+
+            // Extraire les informations utilisateur du token
+            $userId = $payload['id'] ?? null;
+            $userEmail = $payload['email'] ?? null;
+
+            if (!$userId) {
+                return response()->json([
+                    'error' => 'Token invalide - ID utilisateur manquant'
+                ], 401);
+            }
+
+            // Attacher les données utilisateur à la requête
+            $request->merge([
+                'pocketbase_user' => [
+                    'id' => $userId,
+                    'email' => $userEmail,
+                ],
+                'pocketbase_token' => $token,
+            ]);
+
+            return $next($request);
+
+        } catch (\Exception $e) {
             return response()->json([
-                'error' => 'Token invalide ou expiré'
+                'error' => 'Erreur lors de la vérification du token'
             ], 401);
         }
-
-        $userData = $response->json();
-        
-        // Attacher les données utilisateur à la requête
-        $request->merge([
-            'pocketbase_user' => $userData['record'] ?? null,
-            'pocketbase_token' => $token,
-        ]);
-
-        return $next($request);
     }
 }
