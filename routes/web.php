@@ -54,3 +54,11 @@ Route::prefix('api')->middleware('pocketbase.auth')->group(function () {
 // WEBHOOK STRIPE (Public - Stripe l'appelle directement)
 // ========================================
 Route::post('/api/stripe/webhook', [StripeController::class, 'webhook']);
+
+Route::get('/api/csrf-token', function () {
+    // La fonction 'csrf_token()' de Laravel lit le jeton de la session
+    // et le renvoie.
+    return response()->json([
+        'csrf_token' => csrf_token()
+    ]);
+});

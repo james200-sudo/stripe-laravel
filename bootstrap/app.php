@@ -12,9 +12,12 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
          $middleware->alias([
-        'pocketbase.auth' => \App\Http\Middleware\VerifyPocketBaseToken::class,
-    ]);
+            'pocketbase.auth' => \App\Http\Middleware\VerifyPocketBaseToken::class,
+        ]);
+        
     })
+    
+    
     ->withExceptions(function (Exceptions $exceptions): void {
         //
     })->create();
